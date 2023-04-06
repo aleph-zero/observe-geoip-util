@@ -1,5 +1,7 @@
 # observe-geoip-util
 
+Utility to download a Maxmind GeoIP database and upload to Observe (https://www.observeinc.com). Can optionally read `.mmdb` files from the command line. You will need to register for a free API key from Maxmind (https://www.maxmind.com).
+
 go build -o observe-geoip-util main.go 
 
 ```
