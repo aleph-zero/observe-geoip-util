@@ -11,6 +11,7 @@ import (
 	"github.com/oschwald/maxminddb-golang"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -18,10 +19,12 @@ import (
 	"time"
 )
 
-const maxMindEndpoint = "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-City&suffix=tar.gz&license_key=%s"
-const observeEndpoint = "https://%s.collect.observeinc.com/v1/http/geoip?vendor=maxmind"
-const batchSize = 12500
-const workerPoolSize = 1
+const (
+	maxMindEndpoint = "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-City&suffix=tar.gz&license_key=%s"
+	observeEndpoint = "https://%s.collect.observeinc.com/v1/http/geoip?vendor=maxmind"
+	batchSize       = 12500
+	workerPoolSize  = 1
+)
 
 type MaxMindDBRecord struct {
 	City struct {
@@ -60,6 +63,7 @@ func main() {
 	token := flag.String("observe-ingest-token", "", "Observe ingest token")
 	apiKey := flag.String("maxmind-api-key", "", "MaxMind API key")
 	output := flag.Bool("output-json", false, "Print results to JSON")
+	skipv6 := flag.Bool("skip-ipv6", false, "Skip IPv6 networks")
 	filename := flag.String("maxmind-file", "", "Read database file instead of fetching from API")
 
 	flag.Parse()
@@ -72,6 +76,7 @@ func main() {
 	}
 
 	log.Printf("Ingesting to Observe endpoint: %s\n", fmt.Sprintf(observeEndpoint, *customer))
+	log.Printf("Skip IPv6: %t\n", *skipv6)
 
 	var reader io.Reader
 
@@ -111,10 +116,10 @@ func main() {
 		reader = gz
 	}
 
-	process(reader, *customer, *token, *output)
+	process(reader, *customer, *token, *output, *skipv6)
 }
 
-func process(r io.Reader, customer string, token string, output bool) {
+func process(r io.Reader, customer string, token string, output bool, skipv6 bool) {
 
 	tr := tar.NewReader(r)
 
@@ -134,20 +139,19 @@ func process(r io.Reader, customer string, token string, output bool) {
 				if err != nil {
 					log.Fatal(err)
 				}
-				mmdb(data, customer, token, output)
+				mmdb(data, customer, token, output, skipv6)
 			}
 		}
 	}
 }
 
-func mmdb(data []byte, customer string, token string, output bool) {
+func mmdb(data []byte, customer string, token string, output bool, skipv6 bool) {
 
 	mmdb, err := maxminddb.FromBytes(data)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	var record MaxMindDBRecord
 	var index = 0
 	var batch []string
 	var totalRecords = 0
@@ -163,9 +167,21 @@ func mmdb(data []byte, customer string, token string, output bool) {
 			batch = make([]string, batchSize)
 		}
 
+		var record MaxMindDBRecord
+
 		subnet, err := networks.Network(&record)
 		if err != nil {
 			log.Fatal(err)
+		}
+
+		if skipv6 {
+			_, ipv4Net, err := net.ParseCIDR(subnet.String())
+			if err != nil {
+				log.Fatal(err)
+			}
+			if ipv4Net.IP.To4() == nil {
+				continue
+			}
 		}
 
 		record.Network = subnet.String()
@@ -180,7 +196,7 @@ func mmdb(data []byte, customer string, token string, output bool) {
 			fmt.Println(payload)
 		}
 
-		batch[index] = payload
+		batch[index] = strings.Clone(payload)
 		index++
 		totalRecords++
 
@@ -202,7 +218,6 @@ func mmdb(data []byte, customer string, token string, output bool) {
 			index = 0
 		}
 	}
-
 	if index > 0 {
 		data := strings.Join(batch, "\n")
 		batchesSubmitted++
