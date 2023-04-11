@@ -21,15 +21,14 @@ import (
 
 const (
 	maxMindEndpoint = "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-City&suffix=tar.gz&license_key=%s"
-	observeEndpoint = "https://%s.collect.observeinc.com/v1/http/geoip?vendor=maxmind"
+	observeEndpoint = "https://%s.collect.observeinc.com/v1/http/maxmind-geoip"
 	batchSize       = 12500
 	workerPoolSize  = 1
 )
 
 type MaxMindDBRecord struct {
 	City struct {
-		GeonameID uint64            `maxminddb:"geoname_id"`
-		Names     map[string]string `maxminddb:"names"`
+		Names map[string]string `maxminddb:"names"`
 	} `maxminddb:"city"`
 
 	Continent struct {
@@ -214,7 +213,6 @@ func mmdb(data []byte, customer string, token string, output bool, skipv6 bool) 
 				}
 				batchesReturned++
 			})
-
 			index = 0
 		}
 	}
