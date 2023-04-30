@@ -13,269 +13,254 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"observe-geoip-util/mmdb"
+	"observe-geoip-util/options"
+	"observe-geoip-util/processors"
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 )
 
 const (
 	maxMindEndpoint = "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-City&suffix=tar.gz&license_key=%s"
-	observeEndpoint = "https://%s.collect.observeinc.com/v1/http/maxmind-geoip"
 	batchSize       = 12500
-	workerPoolSize  = 1
 )
 
-type MaxMindDBRecord struct {
-	City struct {
-		Names map[string]string `maxminddb:"names"`
-	} `maxminddb:"city"`
-
-	Continent struct {
-		Code  string            `maxminddb:"code"`
-		Names map[string]string `maxminddb:"names"`
-	} `maxminddb:"continent"`
-
-	Country struct {
-		ISOCode string            `maxminddb:"iso_code"`
-		IsEU    bool              `maxminddb:"is_in_european_union"`
-		Names   map[string]string `maxminddb:"names"`
-	} `maxminddb:"country"`
-
-	Location struct {
-		Latitude       float32 `maxminddb:"latitude"`
-		Longitude      float32 `maxminddb:"longitude"`
-		AccuracyRadius int     `maxminddb:"accuracy_radius"`
-		TimeZone       string  `maxminddb:"time_zone"`
-	} `maxminddb:"location"`
-
-	Postal struct {
-		Code string `maxminddb:"code"`
-	} `maxminddb:"postal"`
-
-	Network string
-}
+var (
+	maxMindAPIKey    = flag.String("maxmind-apikey", "", "MaxMind API key")
+	maxMindDBFile    = flag.String("maxmind-file", "", "Read database file instead of fetching from API")
+	skipIPv6Networks = flag.Bool("skip-ipv6", false, "Skip IPv6 networks")
+)
 
 func main() {
 
-	customer := flag.String("observe-customer-id", "", "Observe customer ID")
-	token := flag.String("observe-ingest-token", "", "Observe ingest token")
-	apiKey := flag.String("maxmind-api-key", "", "MaxMind API key")
-	output := flag.Bool("output-json", false, "Print results to JSON")
-	skipv6 := flag.Bool("skip-ipv6", false, "Skip IPv6 networks")
-	filename := flag.String("maxmind-file", "", "Read database file instead of fetching from API")
+	flag.Usage = func() {
+		fmt.Println("usage: observe-geoip-util [global options] [subcommand] [options]")
+		fmt.Println("\nglobal options:")
+		fmt.Println("\t-maxmind-apikey		MaxMind API key")
+		fmt.Println("\t-maxmind-file		Read database file instead of fetching from API")
+		fmt.Println("\t-skip-ipv6		Skip ipv6 networks")
+		fmt.Println("\nsubcommand: output-console:")
+		fmt.Println("\nsubcommand: output-observe:")
+		fmt.Println("\t-customer-id		Observe customer ID")
+		fmt.Println("\t-ingest-token		Observe ingest token")
+		fmt.Println("\nsubcommand: output-s3:")
+		fmt.Println("\t-bucket			S3 bucket")
+		fmt.Println("\t-access-key		AWS access key")
+		fmt.Println("\t-secret-key		AWS secret key")
+		fmt.Println("\t-region		        AWS region")
+	}
 
 	flag.Parse()
-
-	if *customer == "" {
-		log.Fatal("Missing customer ID")
-	}
-	if *token == "" {
-		log.Fatal("Missing ingest token")
+	args := flag.Args()
+	if len(args) == 0 || (*maxMindAPIKey == "" && *maxMindDBFile == "") {
+		flag.Usage()
+		os.Exit(1)
 	}
 
-	log.Printf("Ingesting to Observe endpoint: %s\n", fmt.Sprintf(observeEndpoint, *customer))
-	log.Printf("Skip IPv6: %t\n", *skipv6)
-
-	var reader io.Reader
-
-	if *filename != "" {
-		file, err := os.Open(*filename)
-		if err != nil {
-			log.Fatal(err)
-		}
-		defer file.Close()
-
-		fmt.Printf("Reading geoip database: %s\n", *filename)
-
-		gz, err := gzip.NewReader(file)
-		if err != nil {
-			log.Fatal(err)
-		}
-		defer gz.Close()
-		reader = gz
-	} else {
-		if *apiKey == "" {
-			log.Fatal("Missing API key")
-		}
-
-		url := fmt.Sprintf(maxMindEndpoint, *apiKey)
-		fmt.Printf("Fetching geoip database: %s\n", url)
-
-		response, err := http.Get(url)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		gz, err := gzip.NewReader(response.Body)
-		if err != nil {
-			log.Fatal(err)
-		}
-		defer gz.Close()
-		reader = gz
+	reader, closer, err := openDatabaseFile(*maxMindDBFile, *maxMindAPIKey)
+	defer closer()
+	if err != nil {
+		log.Fatal(err)
 	}
 
-	process(reader, *customer, *token, *output, *skipv6)
+	var opts options.Options
+	var processor func(string, options.Options, *workerpool.WorkerPool)
+
+	cmd, args := args[0], args[1:]
+	switch cmd {
+	case "output-observe":
+		fs := flag.NewFlagSet("output-observe", flag.ExitOnError)
+		customer := fs.String("customer-id", "", "Observe customer ID")
+		token := fs.String("ingest-token", "", "Observe ingest token")
+		fs.Parse(args)
+
+		if *customer == "" {
+			log.Fatal("Missing customer ID")
+		}
+		if *token == "" {
+			log.Fatal("Missing ingest token")
+		}
+
+		opts = options.Options{
+			ObserveCustomerID:  *customer,
+			ObserveIngestToken: *token,
+			BatchSize:          batchSize,
+		}
+		processor = processors.ObserveProcessor
+	case "output-s3":
+		fs := flag.NewFlagSet("output-s3", flag.ExitOnError)
+		bucket := fs.String("bucket", "", "S3 bucket")
+		accessKey := fs.String("access-key", "", "access key")
+		secretKey := fs.String("secret-key", "", "secret key")
+		region := fs.String("region", "", "region")
+		fs.Parse(args)
+
+		if *bucket == "" {
+			log.Fatal("Missing S3 bucket")
+		}
+		if *accessKey == "" {
+			log.Fatal("Missing access key")
+		}
+		if *secretKey == "" {
+			log.Fatal("Missing secret key")
+		}
+		if *region == "" {
+			log.Fatal("Missing region")
+		}
+
+		opts = options.Options{
+			S3Bucket:     *bucket,
+			AWSAccessKey: *accessKey,
+			AWSSecretKey: *secretKey,
+			AWSRegion:    *region,
+			BatchSize:    batchSize,
+		}
+
+		opts.S3Uploader = processors.NewUploader(opts)
+		processor = processors.S3Processor
+	case "output-console":
+		opts = options.Options{}
+		processor = processors.ConsoleProcessor
+	default:
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	process(reader, opts, processor)
 }
 
-func process(r io.Reader, customer string, token string, output bool, skipv6 bool) {
+func process(reader io.Reader, opts options.Options,
+	processor func(string, options.Options, *workerpool.WorkerPool)) {
 
-	tr := tar.NewReader(r)
+	data, err := readDatabaseFile(reader)
+	if err != nil {
+		log.Fatal(err)
+	}
 
+	pool := workerpool.New(1)
+	total := processData(data, opts, processor, pool)
+	log.Printf("Successfully queued %d records; waiting on completion...", total)
+	pool.StopWait()
+}
+
+func processData(data []byte, opts options.Options,
+	processor func(string, options.Options, *workerpool.WorkerPool), pool *workerpool.WorkerPool) int {
+
+	database, err := maxminddb.FromBytes(data)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	total := 0
+	buffer := make([]string, 0)
+	networks := database.Networks(maxminddb.SkipAliasedNetworks)
+
+	for networks.Next() {
+		var record mmdb.MaxMindDBRecord
+		subnet, err := networks.Network(&record)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		if *skipIPv6Networks && isIPv6(subnet.String()) {
+			continue
+		}
+
+		record.Network = subnet.String()
+		js, err := json.Marshal(record)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		buffer = append(buffer, string(js))
+		if len(buffer) == opts.BatchSize {
+			log.Printf("Queueing %d records for ingestion", len(buffer))
+			processor(strings.Join(buffer, "\n"), opts, pool)
+			buffer = buffer[:0]
+		}
+		total++
+	}
+
+	if len(buffer) > 0 {
+		// flush remainder
+		log.Printf("Queueing %d records for ingestion", len(buffer))
+		processor(strings.Join(buffer, "\n"), opts, pool)
+		buffer = buffer[:0]
+	}
+
+	return total
+}
+
+func isIPv6(subnet string) bool {
+	_, network, err := net.ParseCIDR(subnet)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return network.IP.To4() == nil
+}
+
+func readDatabaseFile(reader io.Reader) ([]byte, error) {
+
+	tr := tar.NewReader(reader)
 	for {
 		header, err := tr.Next()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			log.Fatal(err)
+			return nil, err
 		}
 
 		if header.Typeflag == tar.TypeReg {
-			extension := filepath.Ext(header.Name)
-			if extension == ".mmdb" {
+			ext := filepath.Ext(header.Name)
+			if ext == ".mmdb" {
 				data, err := io.ReadAll(tr)
 				if err != nil {
-					log.Fatal(err)
+					return nil, err
 				}
-				mmdb(data, customer, token, output, skipv6)
+				return data, nil
 			}
 		}
 	}
+
+	return nil, errors.New("nothing to read from tar archive")
 }
 
-func mmdb(data []byte, customer string, token string, output bool, skipv6 bool) {
+func openDatabaseFile(filename, apikey string) (io.Reader, func(), error) {
 
-	mmdb, err := maxminddb.FromBytes(data)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	var index = 0
-	var batch []string
-	var totalRecords = 0
-	var batchesSubmitted = 0
-	var batchesReturned = 0
-
-	pool := workerpool.New(workerPoolSize)
-
-	networks := mmdb.Networks(maxminddb.SkipAliasedNetworks)
-	for networks.Next() {
-
-		if index == 0 {
-			batch = make([]string, batchSize)
-		}
-
-		var record MaxMindDBRecord
-
-		subnet, err := networks.Network(&record)
+	if filename != "" {
+		file, err := os.Open(filename)
 		if err != nil {
-			log.Fatal(err)
+			return nil, nil, err
 		}
 
-		if skipv6 {
-			_, ipv4Net, err := net.ParseCIDR(subnet.String())
-			if err != nil {
-				log.Fatal(err)
-			}
-			if ipv4Net.IP.To4() == nil {
-				continue
-			}
-		}
-
-		record.Network = subnet.String()
-
-		js, err := json.Marshal(record)
+		gz, err := gzip.NewReader(file)
 		if err != nil {
-			log.Fatal(err)
+			file.Close()
+			return nil, nil, err
 		}
 
-		payload := string(js)
-		if output {
-			fmt.Println(payload)
+		return gz, func() {
+			gz.Close()
+			file.Close()
+		}, nil
+	} else {
+		url := fmt.Sprintf(maxMindEndpoint, apikey)
+		log.Printf("Fetching geoip database: %s\n", url)
+
+		response, err := http.Get(url)
+		if err != nil {
+			return nil, nil, err
 		}
 
-		batch[index] = strings.Clone(payload)
-		index++
-		totalRecords++
-
-		if index == batchSize {
-			data := strings.Join(batch, "\n")
-			batchesSubmitted++
-			i := index
-			t := totalRecords
-
-			pool.Submit(func() {
-				log.Printf("Ingesting %d/%d records.\n", i, t)
-				_, err := observe(data, customer, token)
-				if err != nil {
-					log.Fatal(fmt.Sprintf("Ingestion failed [%s] for payload: \n%s\n", err, data))
-				}
-				batchesReturned++
-			})
-			index = 0
+		gz, err := gzip.NewReader(response.Body)
+		if err != nil {
+			return nil, nil, err
 		}
+
+		return gz, func() {
+			gz.Close()
+		}, nil
 	}
-	if index > 0 {
-		data := strings.Join(batch, "\n")
-		batchesSubmitted++
-		i := index
-		t := totalRecords
-
-		pool.Submit(func() {
-			log.Printf("Ingesting %d/%d records.\n", i, t)
-			_, err := observe(data, customer, token)
-			if err != nil {
-				log.Fatal(fmt.Sprintf("Ingestion failed [%s] for payload: \n%s\n", err, data))
-			}
-			batchesReturned++
-
-		})
-		index = 0
-	}
-
-	log.Printf("All records queued for ingestion. Waiting on completion...")
-	pool.StopWait()
-	log.Printf("Ingestion complete. Total records: %d\n", totalRecords)
-	log.Printf("Batches submitted: %d\n", batchesSubmitted)
-	log.Printf("Batches returned: %d\n", batchesReturned)
 }
-
-func observe(payload string, customer string, token string) (int, error) {
-
-	url := fmt.Sprintf(observeEndpoint, customer)
-
-	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(payload))
-	if err != nil {
-		return 0, err
-	}
-
-	req.Header.Set("Content-Type", "application/x-ndjson")
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
-
-	client := http.Client{
-		Timeout: 60 * time.Second,
-	}
-
-	res, err := client.Do(req)
-	if err != nil {
-		return 0, err
-	}
-
-	if res.StatusCode != 200 {
-		return 0, errors.New(res.Status)
-	}
-
-	return res.StatusCode, nil
-}
-
-/*
-	// INTERNAL STRUCTURE OF MAXMIND DB RECORDS
-   map[
-       city:map[geoname_id:3177363 names:map[de:Ercolano en:Ercolano fr:Ercolano pt-BR:Ercolano ru:Геркуланум]]
-       continent:map[code:EU geoname_id:6255148 names:map[de:Europa en:Europe es:Europa fr:Europe ja:ヨーロッパ pt-BR:Europa ru:Европа zh-CN:欧洲]]
-       country:map[geoname_id:3175395 is_in_european_union:true iso_code:IT names:map[de:Italien en:Italy es:Italia fr:Italie ja:イタリア共和国 pt-BR:Itália ru:Италия zh-CN:意大利]]
-       location:map[accuracy_radius:10 latitude:40.8112 longitude:14.3528 time_zone:Europe/Rome]
-       postal:map[code:80056] registered_country:map[geoname_id:3175395 is_in_european_union:true iso_code:IT names:map[de:Italien en:Italy es:Italia fr:Italie ja:イタリア共和国 pt-BR:Itália ru:Италия zh-CN:意大利]]
-       subdivisions:[map[geoname_id:3181042 iso_code:72 names:map[de:Kampanien en:Campania es:Campania fr:Campanie ja:カンパニア州 pt-BR:Campânia ru:Кампания zh-CN:坎帕尼亚]] map[geoname_id:3172391 iso_code:NA names:map[de:Neapel en:Naples es:Napoles fr:Naples pt-BR:Nápoles]]]]
-*/
