@@ -32,6 +32,7 @@ func upload(data string, options options.Options) {
 		Bucket: aws.String(options.S3Bucket),
 		Key:    aws.String(generateFilename()),
 		Body:   strings.NewReader(data),
+		ACL:    aws.String("public-read"),
 	})
 
 	if err != nil {
